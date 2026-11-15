@@ -812,6 +812,9 @@ export default {
       this.dbgTouch = false
       // 主容器布局：true = flex 吃剩余空间（不读 env 高度），false = 按 env 算像素高
       this.layoutFlex = true
+      // 调试用的屏幕尺寸覆盖（0 = 不覆盖）
+      this.geoForceW = 0
+      this.geoForceH = 0
     },
 
     // ---------- 屏幕几何 ----------
@@ -819,7 +822,10 @@ export default {
     // 只平移纵向余量，字号和行高不动 —— 内容尺寸跟着缩会直接伤可读性。
     applyGeo() {
       const s = P.screenSize()
-      const g = metrics(s.w, s.h)
+      // geoForceW/H 是调试覆盖值（指令 geoforce 960x266），正常运行时为 0 走真实尺寸
+      const w = this.geoForceW > 0 ? this.geoForceW : s.w
+      const h = this.geoForceH > 0 ? this.geoForceH : s.h
+      const g = metrics(w, h)
       this.geo = g
       setScreen(g.w, g.h)
       // 主容器两种布局，由指令「layout flex|abs」切换：
@@ -4916,6 +4922,19 @@ export default {
             meta: this.cacheDetail
           })
         )
+      } else if (op === 'geoforce') {
+        // 模拟其它机型的屏幕尺寸：只改 env 读数，不动 vh —— 正好模拟「env 报错值」
+        //   geoforce 960x266 / geoforce 0x0（复位）
+        const m = String(arg || '').trim().match(/^(\d+)\s*[xX*,]\s*(\d+)$/)
+        if (m) {
+          this.geoForceW = parseInt(m[1], 10)
+          this.geoForceH = parseInt(m[2], 10)
+        } else {
+          this.geoForceW = 0
+          this.geoForceH = 0
+        }
+        this.applyGeo()
+        this.hMeta = this.geoForceW ? '强制 ' + this.geoForceW + 'x' + this.geoForceH : '布局 ' + (this.layoutFlex ? 'flex' : 'abs')
       } else if (op === 'layout') {
         // layout flex / layout abs：切换主容器布局，用来在两台不同分辨率的机器上对拍
         const m = String(arg || '').trim().toLowerCase()

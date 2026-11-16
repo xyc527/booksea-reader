@@ -432,7 +432,7 @@
 <script>
 import * as P from '@/platform.js'
 import { fontByKey, maxEmOf, maxLinesOf, paginateLines, pageOfOffset, layoutLines, lineOfOffset, ellipsis, FONTS, setScreen } from '@/lib/text.js'
-import { metrics } from '@/lib/geo.js'
+import { metrics, DESIGN_W, DESIGN_H } from '@/lib/geo.js'
 import { parseSearch, parseToc, parseChapter, tocToText, tocFromText } from '@/lib/parse.js'
 import {
   TOC_ROWS,
@@ -810,8 +810,13 @@ export default {
       this.scBusy = false
       // 排查手势时才置 true：打开后按下会记录事件原文与手势诊断
       this.dbgTouch = false
-      // 主容器布局：true = flex 吃剩余空间（不读 env 高度），false = 按 env 算像素高
-      this.layoutFlex = true
+      // 主容器布局：默认 abs —— 按算出来的像素高定高。
+      // flex:1 在这个框架里会把高度交给父容器，而父容器（.app）的实际高度只有约 187
+      // （height:280px 不参与布局计算），于是 .bd 被压到 124，底栏跟着上移 60px，
+      // 正文最后两行正好落在底栏下面 —— 这就是「每章最后一行看不见」。
+      this.layoutFlex = false
+      // 是否走「整张设计稿等比缩放」路线（app.js 里 setViewPort 成功时置 true）
+      this.scaledUI = false
       // 调试用的屏幕尺寸覆盖（0 = 不覆盖）
       this.geoForceW = 0
       this.geoForceH = 0
@@ -825,13 +830,20 @@ export default {
       // geoForceW/H 是调试覆盖值（指令 geoforce 960x266），正常运行时为 0 走真实尺寸
       const w = this.geoForceW > 0 ? this.geoForceW : s.w
       const h = this.geoForceH > 0 ? this.geoForceH : s.h
-      const g = metrics(w, h)
+      // 缩放路线（app.js 里 setViewPort 成功后置 __shVP.ok）：
+      //   框架已把 936×280 的虚拟画布等比缩进屏幕，布局值全部按设计稿算就行，
+      //   不能再按「屏高 − 280」平移 —— 那会算两遍余量，把底栏推到屏幕外。
+      //   留边由缩放比决定，比例不同时是背景色，不裁内容。
+      // 兜底：setViewPort 不存在/抛错时退回老的「按真实高度重排」路线。
+      const vp = (typeof globalThis !== 'undefined' && globalThis.__shVP) || null
+      const scaled = !!(vp && vp.ok) && this.geoForceW <= 0
+      const g = scaled ? metrics(DESIGN_W, DESIGN_H) : metrics(w, h)
+      this.scaledUI = scaled
       this.geo = g
       setScreen(g.w, g.h)
       // 主容器两种布局，由指令「layout flex|abs」切换：
-      //   flex —— 高度交给框架按 100vh 自己算，连 env 都不用读；env 报错值也不会溢出
+      //   flex —— body 吃根容器的剩余空间（根高度已由 appStyle 钉死）
       //   abs  —— 按 env 算出的像素高度，给 flex 链不成立的固件兜底
-      // env 与 vh 同源时两者结果应当完全一致，用截图对拍验证。
       this.bdStyle = this.layoutFlex ? { flex: 1 } : { height: g.body + 'px' }
       this.readCutStyle = { height: g.readCut + 'px' }
       this.setViewStyle = { height: g.setView + 'px' }
@@ -1821,11 +1833,12 @@ export default {
 
     // ---------- 目录 ----------
     // 外层只负责并发闸门与异常兜底：某页抓崩了不能把整条下载链路带下去
-    async ensureChunk(pageNo) {
+    async ensureChunk(pageNo, force) {
       if (!this.book) return
       // 离线降级模式下 chapMap 是本地正文拼的，不需要也不应该再去联网补目录
       if (this.offlineMode) return
-      if (this.chunkLoaded[pageNo]) return
+      // force = 刷新目录：即使内存里标记已加载也重新抓一次（抓不到保留旧块）
+      if (this.chunkLoaded[pageNo] && !force) return
       if (this.chunkLoading[pageNo]) {
         // 同一页已有请求在飞：等它落地，否则调用方会拿到空的 chapMap 直接判「章节缺失」
         const t0 = Date.now()
@@ -1836,7 +1849,7 @@ export default {
       }
       this.chunkLoading[pageNo] = true
       try {
-        await this.ensureChunkInner(pageNo)
+        await this.ensureChunkInner(pageNo, force)
       } catch (e) {
       } finally {
         // 无论成功失败都要放开，否则这一页会永久占着闸门（整本下载卡死的元凶）
@@ -1844,7 +1857,7 @@ export default {
       }
     },
 
-    async ensureChunkInner(pageNo) {
+    async ensureChunkInner(pageNo, force) {
       const bid = this.book.bid
       // 第三方源：Legado 规则只给一页目录，走另一条路（整表铺进 chapMap）
       const ad = this.bookAdapter()
@@ -1852,8 +1865,11 @@ export default {
         await this.ensureChunkAd(ad, pageNo)
         return
       }
-      // 1) 新版紧凑目录缓存在 toc/ 子目录，一页 4KB 左右
-      let parsed = tocFromText(await P.readTocTxt(bid, pageNo))
+      // 1) 新版紧凑目录缓存在 toc/ 子目录，一页 4KB 左右。
+      //    force（刷新目录）时跳过本地缓存，直接联网重抓。
+      let parsed = force
+        ? { total: 0, title: '', chapters: [] }
+        : tocFromText(await P.readTocTxt(bid, pageNo))
       // 2) 旧版缓存的是整页 HTML（124KB），解析后就地转成紧凑格式并删掉
       if (!parsed.chapters.length) {
         const oldHtml = await P.readFile(P.tocHtmlPath(bid, pageNo))
@@ -1865,13 +1881,22 @@ export default {
           }
         }
       }
-      // 3) 都没有才联网
+      // 3) 都没有才联网（force 刷新时一定走这里）
       if (!parsed.chapters.length) {
         const out = P.scratchPath('toc_' + pageNo + '.html')
         const html = await this.fetchUrl(P.urlToc(bid, pageNo), out, 25)
         await P.rm(out)
         parsed = html ? parseToc(html, bid) : { total: 0, title: '', chapters: [] }
-        if (parsed.chapters.length) await P.writeTocTxt(bid, pageNo, tocToText(parsed))
+        if (parsed.chapters.length) {
+          const okToc = await P.writeTocTxt(bid, pageNo, tocToText(parsed))
+          // 目录没落盘不能装作已加载：内存里的 chapMap 照样能读、正文照样会缓存，
+          // 重启后目录却是空的 —— 这就是「内容先于目录被缓存、章节顺序对不上」的来源。
+          // 写失败要冒到界面，让用户知道先别整本缓存。
+          if (!okToc) {
+            this.tocWriteFail = (this.tocWriteFail || 0) + 1
+            this.flash('目录第 ' + pageNo + ' 页没存住（存储异常，先别整本缓存）', 5000)
+          }
+        }
       }
       if (!parsed.chapters.length) {
         this.hMeta = '目录 ' + pageNo + ' 页没抓到'
@@ -2205,7 +2230,8 @@ export default {
       this.rawText = text
       this.rebuildBlocks(text)
       this.loading = ''
-      this.showPage(0)
+      // atBottom：点按模式落到本页最后一页；滚动模式由下面的 setScrollY 拉到底
+      this.showPage(atBottom && this.pageMode !== 'scroll' ? Math.max(0, this.pages.length - 1) : 0)
       // 从章末上滑过来的，落到新章末尾
       if (this.pageMode === 'scroll' && atBottom) this.setScrollY(this.scrollMax)
       this.syncChrome()
@@ -2380,6 +2406,11 @@ export default {
       if (this.pageIndex > 0) {
         this.showPage(this.pageIndex - 1)
         this.saveLast()
+      } else if (this.chapterIndex > 0) {
+        // 本章第一页继续往前翻 → 直接落到上一章最后一页。
+        // 原来这里什么都不做：用户在章首页连点右侧没反应，以为卡了，
+        // 只能先按「上一章」再自己翻到末尾。
+        this.openChapter(this.chapterIndex - 1, true)
       }
     },
 
@@ -2454,16 +2485,33 @@ export default {
     // 其余页保留「未加载」状态，翻到那一屏时再按需重抓。
     async refreshToc(idx) {
       const bid = this.book.bid
-      // 目录整体作废：紧凑缓存目录直接删，旧版 html 也一并清掉
-      await P.clearTocTxt(bid)
-      const oldPages = Math.max(1, Math.ceil((this.total || 0) / 100))
-      for (let p = 1; p <= oldPages; p++) {
+      // 这里原来先 P.clearTocTxt(bid) 把整本目录删光再逐页重抓。
+      // 抓到一半断网／被限流，就只剩半本目录，而正文全都在 →
+      // 用户看到「中间一大段显示加载中、章节跟内容对不上」。
+      // 现在改成逐页覆盖式刷新：抓到才落盘，抓不到的页保留旧块。
+      const pages = Math.max(1, Math.ceil((this.total || 0) / 100))
+      const failed = []
+      for (let p = 1; p <= pages; p++) {
+        this.chunkLoaded[p] = false
+        await this.ensureChunk(p, true)
+        if (!this.chunkLoaded[p]) failed.push(p)
+      }
+      // 总页数变少时清掉多出来的旧块，免得残留旧目录盖住新章
+      const afterPages = Math.max(1, Math.ceil((this.total || 0) / 100))
+      for (let p = afterPages + 1; p <= pages + 10; p++) {
+        await P.rm(P.tocTxtPath(bid, p))
         await P.rm(P.tocHtmlPath(bid, p))
       }
-      this.chunkLoaded = {}
-      this.chunkLoading = {}
-      await this.ensureChunk(tocPageOf(idx))
       if (this.view === 'toc') this.renderToc()
+      if (failed.length) {
+        this.flash(
+          '目录第 ' + failed.slice(0, 3).join('、') + (failed.length > 3 ? ' 等' : '') +
+            ' 页没抓到，已保留旧目录',
+          5000
+        )
+      } else {
+        this.flash('目录已更新 · ' + (this.total || 0) + ' 章', 3000)
+      }
     },
 
     async fetchChapterFresh(bid, c) {
@@ -3139,7 +3187,13 @@ export default {
         queue: queue
       }
       this.dlLabel = '暂停 ' + done + '/' + (queue.length + done)
-      this.hMeta = '从第 ' + (from + 1) + ' 章开始 · 待存 ' + queue.length + ' 章'
+      // 目录缺页时这些章节根本没进队列（不是抓失败，是被静默跳过）。
+      // 必须说出来，否则用户看到「缓存完成」却少了几百章，只会怀疑顺序错乱。
+      const missNote = missing ? ' · 目录缺 ' + missing + ' 章' : ''
+      this.hMeta = '从第 ' + (from + 1) + ' 章开始 · 待存 ' + queue.length + ' 章' + missNote
+      if (missing) {
+        this.flash('有 ' + missing + ' 章目录没取到，本次跳过；回目录点刷新补齐后再缓存', 6000)
+      }
       this.dlResume = null
       this.updateDlBar()
       this.persistDl()
@@ -4592,6 +4646,18 @@ export default {
     // out 只是 curl 落地用的临时文件，内容读完就删；早期版本留着当代价极高的「缓存」
     async fetchUrl(url, out, timeout) {
       const t = timeout || 25
+      // shell 通道坏掉（缺 global 模块 / execShell 抛错）的机器上，
+      // curl 一次都跑不起来：直接走 jsapi.http，否则表现为「能进但搜不到书」。
+      if (P.shellBroken()) {
+        const s0 = await P.httpGet(url, t)
+        if (s0) {
+          this.online = true
+          return s0
+        }
+        this.online = false
+        this.updateFoot()
+        return null
+      }
       // 断网时后台要等 34s + 同步 30s 才报错，先探一次站点，探不通立刻放弃
       const up = await P.netUp(false)
       if (up === false) {
@@ -5001,10 +5067,11 @@ export default {
 <style>
 /* ===== 基础 ===== */
 .app {
-  /* 宽高交给设备：上架全设备后逻辑分辨率有 936×280 / 960×266 等多档，
-     写死任何一档都会在别的机型上裁切。各容器高度由 applyGeo() 内联注入。 */
-  width: 100vw;
-  height: 100vh;
+  /* 宽高必须写在类里：根节点上的内联 :style 不被框架采纳（实测把 280 传给
+     :style 后，根节点仍按内容高度收成 230，底栏跟着上移、正文少两行）。
+     所以这里按设计稿写死，其他机型的分辨率适配走 applyGeo 的内部容器。 */
+  width: 936px;
+  height: 280px;
   background-color: #0b0b0e;
   flex-direction: column;
 }
@@ -5366,6 +5433,10 @@ export default {
 
 /* ===== 阅读 ===== */
 .read {
+  /* 高度必须写在类里：内联 :style 的 height 与 flex:1 同时存在时，
+     flex 会把高度交给父容器（实测压到 124px），底栏跟着上移 60px，
+     正文最后两行正好落在底栏下面。类里的 height 才会真正参与布局计算。 */
+  height: 217px;
   padding-left: 16px;
   padding-right: 16px;
   padding-top: 4px;

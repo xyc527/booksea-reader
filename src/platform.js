@@ -387,8 +387,24 @@ export async function loadBoth(key, path) {
   return { value: null, from: 'none' }
 }
 
+// 跨设备保险：`global` 模块在部分机型/固件上可能缺失，构造即抛错 → 整页白屏。
+// 构造失败时退到桩对象，调用点（sh/输入法等）不用改，能力自然降级。
+const NOOP_G = {
+  execShell: function () { return false },
+  startTextEdit: function () { return null },
+  closeTextEdit: function () {},
+  textEditFinished: { on: function () {}, off: function () {} },
+}
+let G_ERR = ''
+export function globalErr() { return G_ERR }
 function globalInst() {
-  if (!G) G = new g.Global()
+  if (G) return G
+  try {
+    G = new g.Global()
+  } catch (e) {
+    G_ERR = String((e && e.message) || e)
+    G = NOOP_G
+  }
   return G
 }
 
@@ -401,6 +417,85 @@ export function sh(cmd, tag) {
   } catch (e) {
     rec(tag || 'sh', t)
     return false
+  }
+}
+
+// ---------- 网络兜底：$falcon.jsapi.http ----------
+// 现有网络 100% 走 `curl` + execShell。execShell 来自 `global` 模块，
+// 个别运行体上模块缺失、或 execShell 直接抛错 —— 那台机器就会「界面能进、一搜就空」。
+// 官方文档（POSC 10.1）给的通道是 `$falcon.jsapi.http`，原生模块，不能静态 import。
+//   http.request({ url, method, headers: ['K:v'], timeout }) -> Promise<ArrayBuffer>
+// 只有 shell 通道确认坏了才切到这里，正常机器一行都不会执行。
+export function shellBroken() {
+  if (!G_ERR) {
+    try {
+      globalInst()
+    } catch (e) {}
+  }
+  return !!G_ERR
+}
+
+export function httpAvailable() {
+  try {
+    if (typeof $falcon === 'undefined' || !$falcon || !$falcon.jsapi) return false
+    const h = $falcon.jsapi.http
+    return !!(h && typeof h.request === 'function')
+  } catch (e) {
+    return false
+  }
+}
+
+// QuickJS 没有 TextDecoder，自己解 UTF-8（源站全是中文，不能按 latin1 取）
+function utf8Decode(u8) {
+  let out = ''
+  let i = 0
+  const n = u8.length
+  while (i < n) {
+    const b0 = u8[i++]
+    if (b0 < 0x80) {
+      out += String.fromCharCode(b0)
+    } else if (b0 < 0xe0) {
+      out += String.fromCharCode(((b0 & 0x1f) << 6) | (u8[i++] & 0x3f))
+    } else if (b0 < 0xf0) {
+      const b1 = u8[i++]
+      const b2 = u8[i++]
+      out += String.fromCharCode(((b0 & 0x0f) << 12) | ((b1 & 0x3f) << 6) | (b2 & 0x3f))
+    } else {
+      const b1 = u8[i++]
+      const b2 = u8[i++]
+      const b3 = u8[i++]
+      const cp = (((b0 & 0x07) << 18) | ((b1 & 0x3f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f)) - 0x10000
+      out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff))
+    }
+  }
+  return out
+}
+
+export async function httpGet(url, timeout) {
+  let h = null
+  try {
+    h = ($falcon && $falcon.jsapi && $falcon.jsapi.http) || null
+  } catch (e) {}
+  if (!h || typeof h.request !== 'function') return null
+  try {
+    const res = await h.request({
+      url: url,
+      method: 'GET',
+      headers: ['User-Agent:' + UA, 'Accept-Encoding:identity'],
+      timeout: timeout || 20
+    })
+    if (!res) return null
+    if (typeof res === 'string') return res
+    let u8 = null
+    try {
+      if (res instanceof ArrayBuffer) u8 = new Uint8Array(res)
+    } catch (e) {}
+    if (!u8 && res.buffer) u8 = new Uint8Array(res.buffer)
+    if (!u8 && typeof res.length === 'number') u8 = res
+    if (!u8) return null
+    return utf8Decode(u8)
+  } catch (e) {
+    return null
   }
 }
 

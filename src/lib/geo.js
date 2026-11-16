@@ -77,3 +77,39 @@ export function metrics(w, h) {
 export function fits(g) {
   return g.body + CHROME.header + CHROME.footer <= g.h
 }
+
+// ---------------------------------------------------------------------------
+// 等比缩放（官方 `setViewPort(设计宽)` 路线）+ 留边
+//
+// 官方文档 `app/css/css-screen.md` 的推荐做法：px 布局 + `setViewPort(N)`，
+// 框架把「宽 N 的虚拟画布」缩放到设备宽高。真机实测（2026-11-16）：
+//   - 缩放确实生效（设计宽 700 时内容放大 936/700 ≈ 1.34 倍）；
+//   - 渲染树里的布局值仍是设计值（936×280），缩放发生在合成层；
+//   - 触摸坐标会被换算回设计空间（点按翻页的左右分界不用改）。
+//
+// 但 `setViewPort` 只按「宽」定缩放比、高度跟着同一个比缩放，
+// 所以直接传设计宽会在更扁的屏上把底部切掉。这里反解出虚拟宽：
+//   scale = min(W/936, H/280)  →  V = W / scale
+// 整张 936×280 设计稿等比进屏，比例不同时留一圈底色，**任何机型都不会裁内容**。
+// ---------------------------------------------------------------------------
+export function fitViewport(w, h) {
+  const s = normScreen(w, h)
+  if (s.fallback) return { ok: false, v: DESIGN_W, scale: 1, why: 'env' }
+  const byW = s.w / DESIGN_W
+  const byH = s.h / DESIGN_H
+  const scale = Math.min(byW, byH)
+  if (!(scale > 0) || !isFinite(scale)) return { ok: false, v: DESIGN_W, scale: 1, why: 'nan' }
+  // 虚拟宽 = 真实宽 / 缩放比。取一位小数：框架内部是否取整未知，误差 < 0.1%
+  const v = Math.round((s.w / scale) * 10) / 10
+  return {
+    ok: true,
+    v: v,
+    scale: scale,
+    w: s.w,
+    h: s.h,
+    // 哪一边留底色：tall = 屏比设计稿更高（左右留边），flat = 更扁（上下留边）
+    tall: byH > byW,
+    boxW: Math.round(DESIGN_W * scale),
+    boxH: Math.round(DESIGN_H * scale)
+  }
+}

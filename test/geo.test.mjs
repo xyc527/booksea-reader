@@ -1,5 +1,5 @@
 // 屏幕几何与分页自适配断言（纯函数，不需要设备）
-import { metrics, normScreen, DESIGN_W, DESIGN_H, BASE, CHROME, fits } from '../src/lib/geo.js'
+import { metrics, normScreen, fitViewport, DESIGN_W, DESIGN_H, BASE, CHROME, fits } from '../src/lib/geo.js'
 import { setScreen, maxLinesOf, maxEmOf, bodyH, fontByKey, paginateLines, layoutLines } from '../src/lib/text.js'
 
 let pass = 0
@@ -119,6 +119,56 @@ eq(covered, laid.items.length, 'every laid line lands on a page after resize')
 // 竖向空间不足时行数不能为 0（Math.floor 到 0 会让阅读页空白）
 setScreen(320, 120)
 ok(maxLinesOf(M) >= 1, 'tiny screen still yields 1 line per page', maxLinesOf(M))
+
+// ---------- 等比缩放（setViewPort 路线） ----------
+// 设计稿 936×280 必须整张进屏：scale = min(W/936, H/280)，V = W/scale
+{
+  const f = fitViewport(936, 280)
+  eq(f.ok, true, 'fit: 936x280 ok')
+  ok(Math.abs(f.v - 936) < 0.2, 'fit: 936x280 virtual width == 936', String(f.v))
+  ok(Math.abs(f.scale - 1) < 1e-6, 'fit: 936x280 scale == 1')
+
+  // 更扁的屏（960×266）：按高定比，左右留边，画布高正好等于屏高
+  const g = fitViewport(960, 266)
+  ok(g.ok, 'fit: 960x266 ok')
+  ok(Math.abs(g.scale - 266 / 280) < 1e-6, 'fit: 960x266 scale by height', String(g.scale))
+  ok(g.tall === false, 'fit: 960x266 needs left/right margin')
+  ok(g.boxH === 266, 'fit: 960x266 canvas height fits screen', String(g.boxH))
+  ok(g.boxW <= 960, 'fit: 960x266 canvas width fits screen', String(g.boxW))
+  ok(g.v > 936, 'fit: 960x266 virtual width > design width', String(g.v))
+  // 反解自检：真实宽 / 缩放比 == 虚拟宽
+  ok(Math.abs(960 / g.scale - g.v) < 0.06, 'fit: virtual width = W / scale')
+
+  // 1024×300 比设计稿更扁（3.41 > 3.34）：仍按高定比，左右留边
+  const t = fitViewport(1024, 300)
+  ok(Math.abs(t.scale - 300 / 280) < 1e-6, 'fit: 1024x300 scale by height', String(t.scale))
+  ok(t.tall === false, 'fit: 1024x300 needs left/right margin')
+  ok(t.boxH === 300, 'fit: 1024x300 canvas height fills screen', String(t.boxH))
+  ok(t.boxW <= 1024, 'fit: 1024x300 canvas width fits screen', String(t.boxW))
+
+  // 真正的「更高」屏（4:3）：按宽定比，上下留边
+  const t2 = fitViewport(800, 600)
+  ok(Math.abs(t2.scale - 800 / 936) < 1e-6, 'fit: 800x600 scale by width', String(t2.scale))
+  ok(t2.tall === true, 'fit: 800x600 needs top/bottom margin')
+  eq(t2.boxW, 800, 'fit: 800x600 canvas width fills screen')
+  ok(t2.boxH <= 600, 'fit: 800x600 canvas height fits screen', String(t2.boxH))
+
+  // 极端比例：内容变小但绝不溢出（这是「任何机型都不裁内容」的数学保证）
+  // 注意竖屏会被 normScreen 归一成横屏，比较要用归一后的尺寸
+  for (const [w0, h0] of [[800, 480], [480, 640], [800, 240], [1280, 320]]) {
+    const s0 = normScreen(w0, h0)
+    const e = fitViewport(w0, h0)
+    ok(e.ok, 'fit ' + w0 + 'x' + h0 + ' ok')
+    ok(e.boxW <= s0.w + 0.5 && e.boxH <= s0.h + 0.5, 'fit ' + w0 + 'x' + h0 + ' never overflows', e.boxW + 'x' + e.boxH + ' screen ' + s0.w + 'x' + s0.h)
+    ok(e.scale > 0 && isFinite(e.scale), 'fit ' + w0 + 'x' + h0 + ' scale positive finite', String(e.scale))
+  }
+
+  // 取不到环境变量时不能瞎缩：返回 ok=false，调用方退回老路线
+  const bad = fitViewport(0, 0)
+  eq(bad.ok, false, 'fit: 0x0 not ok')
+  eq(bad.v, DESIGN_W, 'fit: fallback virtual width == design width')
+  eq(bad.scale, 1, 'fit: fallback scale == 1')
+}
 
 // 复位：其他测试文件依赖设计稿默认值
 setScreen(936, 280)
